@@ -133,30 +133,6 @@ struct TTetsEnvBase {
         return ReadLastPartFromVDisk(0, 0, partData, inspect);
     }
 
-    NKikimrProto::EReplyStatus ReadFullDataPartFromVDisk(ui32 dataPartIndex) {
-        NKikimrProto::EReplyStatus status = NKikimrProto::ERROR;
-        TBlobStorageGroupInfo::TVDiskIds vdiskIds;
-        GroupInfo->PickSubgroup(LastBlobId.Hash(), &vdiskIds, nullptr);
-        UNIT_ASSERT(dataPartIndex < GroupInfo->Type.DataParts());
-        const TVDiskID& vdiskId = vdiskIds[dataPartIndex];
-        const TLogoBlobID partId(LastBlobId, dataPartIndex + 1);
-
-        Env.WithQueueId(vdiskId, NKikimrBlobStorage::EVDiskQueueId::GetFastRead, [&](TActorId queueId) {
-            const TActorId& edge = Env.Runtime->AllocateEdgeActor(queueId.NodeId(), __FILE__, __LINE__);
-            Env.Runtime->Send(new IEventHandle(queueId, edge, TEvBlobStorage::TEvVGet::CreateExtremeDataQuery(vdiskId,
-                TInstant::Max(), NKikimrBlobStorage::EGetHandleClass::FastRead, TEvBlobStorage::TEvVGet::EFlags::None,
-                Nothing(), {TEvBlobStorage::TEvVGet::TExtremeQuery(partId, 0, 0)}).release()), queueId.NodeId());
-
-            auto response = Env.WaitForEdgeActorEvent<TEvBlobStorage::TEvVGetResult>(edge, false);
-            const auto& record = response->Get()->Record;
-            UNIT_ASSERT_VALUES_EQUAL(record.GetStatus(), NKikimrProto::OK);
-            UNIT_ASSERT_VALUES_EQUAL(record.ResultSize(), 1);
-            status = record.GetResult(0).GetStatus();
-        });
-
-        return status;
-    }
-
     NKikimrBlobStorage::TEvVMultiPutResult SendVMultiPutToVDisk(std::unique_ptr<TEvBlobStorage::TEvVMultiPut> event) {
         NKikimrBlobStorage::TEvVMultiPutResult result;
         Env.WithQueueId(GroupInfo->GetVDiskId(0), NKikimrBlobStorage::EVDiskQueueId::PutTabletLog, [&](TActorId queueId) {
@@ -191,6 +167,8 @@ TEnvironmentSetup::TSettings Block42Xxh3HeaderSettings() {
         .Erasure = TBlobStorageGroupType::Erasure4Plus2Block,
         .VDiskConfigPreprocessor = [](TVDiskConfig& config) {
             config.BlobHeaderMode = EBlobHeaderMode::XXH3_64BIT_HEADER;
+            config.EnableChecksumReadValidationOnVDisk = 1;
+            config.EnableChecksumWriteValidationOnVDisk = 1;
         },
     };
 }
@@ -219,10 +197,11 @@ THashSet<ui32> OrderNumsToNodeIds(const TTetsEnvBase& env, const TVector<ui32>& 
 
 void CorruptStoredBlobChecksum(NPDisk::TEvChunkReadResult& res) {
     auto buf = res.Data.ToString();
-    Y_ABORT_UNLESS(buf.size() >= sizeof(ui64));
+    Y_ABORT_UNLESS(!buf.empty());
     auto newBuf = TRcBuf::Copy(buf);
-    newBuf[buf.size() - 1] ^= 1;
+    newBuf[buf.size() / 2] ^= 1;
     res.Data.SetData(std::move(newBuf));
+    res.Status = NKikimrProto::CORRUPTED;
 }
 
 struct TChunkReadCorruptionFilter {
@@ -243,22 +222,18 @@ struct TChunkReadCorruptionFilter {
                 }
             }
             if (ev->GetTypeRewrite() == TEvBlobStorage::EvRestoreCorruptedBlob) {
-                if (TargetNodes.contains(ev->Sender.NodeId())) {
-                    const auto* restoreEv = ev->Get<TEvRestoreCorruptedBlob>();
-                    for (const auto& item : restoreEv->Items) {
-                        if (item.BlobId.IsSameBlob(BlobId)) {
-                            ++RestoreRequestsReceived;
-                        }
+                const auto* restoreEv = ev->Get<TEvRestoreCorruptedBlob>();
+                for (const auto& item : restoreEv->Items) {
+                    if (item.BlobId.IsSameBlob(BlobId)) {
+                        ++RestoreRequestsReceived;
                     }
                 }
             }
             if (ev->GetTypeRewrite() == TEvBlobStorage::EvRestoreCorruptedBlobResult) {
-                if (TargetNodes.contains(ev->Recipient.NodeId())) {
-                    const auto* restoreEv = ev->Get<TEvRestoreCorruptedBlobResult>();
-                    for (const auto& item : restoreEv->Items) {
-                        if (item.BlobId.IsSameBlob(BlobId) && item.Status == NKikimrProto::OK) {
-                            ++RestoreResultsReceived;
-                        }
+                const auto* restoreEv = ev->Get<TEvRestoreCorruptedBlobResult>();
+                for (const auto& item : restoreEv->Items) {
+                    if (item.BlobId.IsSameBlob(BlobId) && item.Status == NKikimrProto::OK) {
+                        ++RestoreResultsReceived;
                     }
                 }
             }
@@ -450,12 +425,10 @@ Y_UNIT_TEST(VDiskAcceptsCorrectData) {
 }
 
 Y_UNIT_TEST(VDiskRejectsCorruptedData) {
-    // PUT: VDisk rejects mismatched checksum; DsProxy returns TEvPutResult ERROR to tablet.
     TTetsEnvBase env(Xxh3HeaderSettings());
     env.EnableChecksumCalcAndValidationOnDsProxy();
     env.EnableChecksumWriteValidationOnVDisk();
 
-    // Corrupt payload in flight; checksum in VPut no longer matches data.
     env.Env.Runtime->FilterFunction = [&](ui32 /*nodeId*/, std::unique_ptr<IEventHandle>& ev) {
         if (IsVPutToVDisk(env, ev)) {
             auto* vput = ev->Get<TEvBlobStorage::TEvVPut>();
@@ -464,7 +437,7 @@ Y_UNIT_TEST(VDiskRejectsCorruptedData) {
         return true;
     };
 
-    auto writeResult = env.WriteData("test corrupted checksum on put");
+    auto writeResult = env.WriteData(GenData(16_KB, 3));
     UNIT_ASSERT_EQUAL(writeResult->Get()->Status, NKikimrProto::ERROR);
     UNIT_ASSERT_STRING_CONTAINS(writeResult->Get()->ErrorReason, "buffer checksum mismatch");
 }
@@ -678,9 +651,10 @@ Y_UNIT_TEST(VDiskCorruptedStoredChecksumReadRestoration) {
     };
     env.Env.Runtime->FilterFunction = filter.MakeFilter();
 
-    UNIT_ASSERT_VALUES_EQUAL(env.ReadFullDataPartFromVDisk(0), NKikimrProto::OK);
+    auto readResult = env.ReadDataFromDsProxy();
     UNIT_ASSERT_VALUES_EQUAL(filter.CorruptedNodes.size(), 1u);
     UNIT_ASSERT_VALUES_EQUAL(filter.RestoreRequestsReceived, 1u);
+    UNIT_ASSERT_VALUES_EQUAL_C(readResult->Get()->Status, NKikimrProto::OK, readResult->Get()->ToString());
 
     WaitForAsyncBlobRestore(env, 1, filter.RestoreResultsReceived);
     UNIT_ASSERT_VALUES_EQUAL(filter.RestoreResultsReceived, 1u);
@@ -707,10 +681,10 @@ Y_UNIT_TEST(VDiskCorruptedStoredChecksumReadRestorationOnTwoVDisks) {
     };
     env.Env.Runtime->FilterFunction = filter.MakeFilter();
 
-    UNIT_ASSERT_VALUES_EQUAL(env.ReadFullDataPartFromVDisk(0), NKikimrProto::OK);
-    UNIT_ASSERT_VALUES_EQUAL(env.ReadFullDataPartFromVDisk(1), NKikimrProto::OK);
+    auto readResult = env.ReadDataFromDsProxy();
     UNIT_ASSERT_VALUES_EQUAL(filter.CorruptedNodes.size(), 2u);
     UNIT_ASSERT_VALUES_EQUAL(filter.RestoreRequestsReceived, 2u);
+    UNIT_ASSERT_VALUES_EQUAL_C(readResult->Get()->Status, NKikimrProto::OK, readResult->Get()->ToString());
 
     WaitForAsyncBlobRestore(env, 2, filter.RestoreResultsReceived);
     UNIT_ASSERT_VALUES_EQUAL(filter.RestoreResultsReceived, 2u);
